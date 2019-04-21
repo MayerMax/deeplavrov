@@ -21,8 +21,8 @@ class WordVocabEncoder:
         self.source_vocab = source_vocab
         self.target_vocab = target_vocab
 
-        self.source_reverse_vocab = WordVocabEncoder.__get_reverse_vocab(self.source_vocab)
-        self.target_reverse_vocab = WordVocabEncoder.__get_reverse_vocab(self.target_vocab)
+        self.source_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.source_vocab)
+        self.target_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.target_vocab)
 
         self.source_tokenizing_method = source_tokenizing_method
         self.target_tokenizing_method = target_tokenizing_method
@@ -55,17 +55,17 @@ class WordVocabEncoder:
         :return: None
         """
         if is_source:
-            self.source_vocab = self.__build_vocab_from_file(corpora,
-                                                             __tokenizer__.get(self.source_tokenizing_method),
-                                                             n_jobs)
+            self.source_vocab = self._build_vocab_from_file(corpora,
+                                                            __tokenizer__.get(self.source_tokenizing_method),
+                                                            n_jobs)
 
-            self.source_reverse_vocab = WordVocabEncoder.__get_reverse_vocab(self.source_vocab)
+            self.source_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.source_vocab)
         else:
-            self.target_vocab = self.__build_vocab_from_file(corpora,
-                                                             __tokenizer__.get(self.target_tokenizing_method),
-                                                             n_jobs)
+            self.target_vocab = self._build_vocab_from_file(corpora,
+                                                            __tokenizer__.get(self.target_tokenizing_method),
+                                                            n_jobs)
 
-            self.target_reverse_vocab = WordVocabEncoder.__get_reverse_vocab(self.target_vocab)
+            self.target_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.target_vocab)
 
     def save(self, filename):
         fields = {k: v for k, v in self.__dict__.items() if k not in ['source_reverse_vocab', 'target_reverse_vocab']}
@@ -79,14 +79,17 @@ class WordVocabEncoder:
             fields = json.load(f)
         return WordVocabEncoder(**fields)
 
-    def __build_vocab_from_file(self, filename, tokenizing_method, n_jobs=4):
+    def _build_vocab_from_file(self, filename, tokenizing_method, n_jobs=4):
         start = time.time()
         frequencies = Counter()
         with open(filename, encoding=self.encoding) as f:
-            batch = islice(f, 10000)
-            with Pool(n_jobs) as pool:
-                for processed in pool.imap(func=tokenizing_method, iterable=batch):
-                    frequencies.update([self.start_symbol] + processed + [self.end_symbol])
+            while True:
+                batch = list(islice(f, 100000))
+                if not batch:
+                    break
+                with Pool(n_jobs) as pool:
+                    for processed in pool.imap(func=tokenizing_method, iterable=batch):
+                        frequencies.update([self.start_symbol] + processed + [self.end_symbol])
         end = time.time()
         print('Building vocab from {} took {} second(s)'.format(filename, end - start))
 
@@ -98,7 +101,7 @@ class WordVocabEncoder:
         return vocab
 
     @classmethod
-    def __get_reverse_vocab(cls, vocab):
+    def _get_reverse_vocab(cls, vocab):
         if not vocab:
             return None
         return {idx: key for key, idx in vocab.items()}

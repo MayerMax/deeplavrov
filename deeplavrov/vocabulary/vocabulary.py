@@ -1,12 +1,13 @@
 import json
 import time
 from collections import Counter
-from itertools import islice
+from itertools import islice, chain
 from multiprocessing.pool import Pool
 
 import nltk
+from keras.preprocessing.sequence import pad_sequences
 
-__tokenizer__ = {
+_tokenizer = {
     'nltk': nltk.word_tokenize
 }
 
@@ -15,8 +16,9 @@ class WordVocabEncoder:
     def __init__(self, source_vocab=None,
                  target_vocab=None,
                  source_tokenizing_method='nltk', target_tokenizing_method='nltk',
-                 max_seq_len=120, padding_symbol='<pad>', unknown_symbol='<unk>',
-                 start_symbol='#start#', end_symbol='#end#', encoding='utf-8', word_min_freq=2):
+                 max_source_len=120, max_target_len=120, padding_symbol='<pad>', pad_source_pre=True,
+                 pad_target_pre=False, unknown_symbol='<unk>',
+                 start_symbol='#start#', end_symbol='#end#', encoding='utf-8', word_min_freq=2, **kwargs):
 
         self.source_vocab = source_vocab
         self.target_vocab = target_vocab
@@ -27,13 +29,45 @@ class WordVocabEncoder:
         self.source_tokenizing_method = source_tokenizing_method
         self.target_tokenizing_method = target_tokenizing_method
 
-        self.max_seq_len = max_seq_len
+        self.max_source_len = max_source_len
+        self.max_target_len = max_target_len
+
         self.padding_symbol = padding_symbol
+        self.pad_source_pre = pad_source_pre
+        self.pad_target_pre = pad_target_pre
+
         self.unknown_symbol = unknown_symbol
         self.start_symbol = start_symbol
         self.end_symbol = end_symbol
         self.encoding = encoding
         self.word_min_freq = word_min_freq
+
+    def to_indices(self, texts, is_source=True):
+        if is_source:
+            return [[self.source_vocab.get(x, -1) for x in chain([self.start_symbol],
+                                                                 _tokenizer.get(self.source_tokenizing_method)(text),
+                                                                 [self.end_symbol])]
+                    for text in texts]
+        return [[self.target_vocab.get(x, -1) for x in chain([self.start_symbol],
+                                                             _tokenizer.get(self.target_tokenizing_method)(text),
+                                                             [self.end_symbol])]
+                for text in texts]
+
+    def to_text(self, indices, is_source=True):
+        if is_source:
+            exclude = [0, self.source_vocab[self.start_symbol], self.source_vocab[self.end_symbol]]
+            return [' '.join([self.source_reverse_vocab[x] for x in seq if x not in exclude]) for seq in indices]
+        else:
+            exclude = [0, self.target_vocab[self.start_symbol], self.target_vocab[self.end_symbol]]
+            return [' '.join([self.target_reverse_vocab[x] for x in seq if x not in exclude]) for seq in indices]
+
+    def pad_indices(self, indices, is_source=True):
+        if is_source:
+            strategy = 'pre' if self.pad_source_pre else 'post'
+            return pad_sequences(indices, maxlen=self.max_source_len, padding=strategy)
+        else:
+            strategy = 'pre' if self.pad_target_pre else 'post'
+            return pad_sequences(indices, maxlen=self.max_target_len, padding=strategy)
 
     def build(self, source_corpora, target_corpora, n_jobs=4):
         """
@@ -56,13 +90,13 @@ class WordVocabEncoder:
         """
         if is_source:
             self.source_vocab = self._build_vocab_from_file(corpora,
-                                                            __tokenizer__.get(self.source_tokenizing_method),
+                                                            _tokenizer.get(self.source_tokenizing_method),
                                                             n_jobs)
 
             self.source_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.source_vocab)
         else:
             self.target_vocab = self._build_vocab_from_file(corpora,
-                                                            __tokenizer__.get(self.target_tokenizing_method),
+                                                            _tokenizer.get(self.target_tokenizing_method),
                                                             n_jobs)
 
             self.target_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.target_vocab)
@@ -105,6 +139,7 @@ class WordVocabEncoder:
         if not vocab:
             return None
         return {idx: key for key, idx in vocab.items()}
+
 
 # if __name__ == '__main__':
 #     a = WordVocabEncoder()

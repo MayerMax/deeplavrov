@@ -1,5 +1,8 @@
 import os
 
+from itertools import islice
+from multiprocessing.pool import Pool
+
 from deeplavrov.vocabulary.vocabulary import WordVocabEncoder
 
 import tensorflow as tf
@@ -99,6 +102,22 @@ class WordLevelRNNTranslator:
     def save(self, filename):
         pass
 
+    def _process_pair(self, source_target_pair):
+        source_text, target_text = source_target_pair
+        return (self.vocab_encoder.text_to_indices(source_text.strip(), is_source=True),
+                self.vocab_encoder.text_to_indices(target_text.strip(), is_source=False))
+
+    def _file_generator(self, source_filename, target_filename, n_jobs=4):
+        with open(source_filename, encoding='utf-8') as source_f, open(target_filename, encoding='utf-8') as target_f:
+            with Pool(n_jobs) as pool:
+                while True:
+                    source_batch = list(islice(source_f, 100000))
+                    target_batch = list(islice(target_f, 100000))
+                    if not source_batch or not target_batch:
+                        break
+
+                    yield from pool.imap(func=self._process_pair, iterable=zip(source_batch, target_batch))
+
     def fit_from_file(self, source_corpora, target_corpora, n_jobs=4, checkpoint_dir='./training_checkpoints'):
         self.vocab_encoder.build(source_corpora, target_corpora, n_jobs=n_jobs)
         self.vocab_encoder.save('vocabulary_index.json')
@@ -116,3 +135,5 @@ class WordLevelRNNTranslator:
                                          encoder=self.encoder,
                                          decoder=self.decoder)
 
+        generator = lambda: self._file_generator(source_corpora, target_corpora)
+        dataset = tf.data.Dataset.from_generator(generator, (tf.int32, tf.int32))

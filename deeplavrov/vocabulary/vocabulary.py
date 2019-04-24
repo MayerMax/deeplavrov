@@ -42,32 +42,34 @@ class WordVocabEncoder:
         self.encoding = encoding
         self.word_min_freq = word_min_freq
 
-    def to_indices(self, texts, is_source=True):
+    def to_indices(self, text, is_source=True):
         if is_source:
-            return [[self.source_vocab.get(x, -1) for x in chain([self.start_symbol],
-                                                                 _tokenizer.get(self.source_tokenizing_method)(text),
-                                                                 [self.end_symbol])]
-                    for text in texts]
-        return [[self.target_vocab.get(x, -1) for x in chain([self.start_symbol],
-                                                             _tokenizer.get(self.target_tokenizing_method)(text),
-                                                             [self.end_symbol])]
-                for text in texts]
+            return [self.source_vocab.get(x, -1) for x in chain([self.start_symbol],
+                                                                _tokenizer.get(self.source_tokenizing_method)(text),
+                                                                [self.end_symbol])]
+        return [self.target_vocab.get(x, -1) for x in chain([self.start_symbol],
+                                                            _tokenizer.get(self.target_tokenizing_method)(text),
+                                                            [self.end_symbol])]
 
     def to_text(self, indices, is_source=True):
         if is_source:
             exclude = [0, self.source_vocab[self.start_symbol], self.source_vocab[self.end_symbol]]
-            return [' '.join([self.source_reverse_vocab[x] for x in seq if x not in exclude]) for seq in indices]
+            return ' '.join([self.source_reverse_vocab[x] for x in indices if x not in exclude])
         else:
             exclude = [0, self.target_vocab[self.start_symbol], self.target_vocab[self.end_symbol]]
-            return [' '.join([self.target_reverse_vocab[x] for x in seq if x not in exclude]) for seq in indices]
+            return ' '.join([self.target_reverse_vocab[x] for x in indices if x not in exclude])
 
     def pad_indices(self, indices, is_source=True):
         if is_source:
             strategy = 'pre' if self.pad_source_pre else 'post'
-            return pad_sequences(indices, maxlen=self.max_source_len, padding=strategy)
+            return pad_sequences([indices], maxlen=self.max_source_len, padding=strategy)[0]
         else:
             strategy = 'pre' if self.pad_target_pre else 'post'
-            return pad_sequences(indices, maxlen=self.max_target_len, padding=strategy)
+            return pad_sequences([indices], maxlen=self.max_target_len, padding=strategy)[0]
+
+    def text_to_indices(self, text, is_source=True):
+        indices = self.to_indices(text, is_source)
+        return self.pad_indices(indices, is_source)
 
     def build(self, source_corpora, target_corpora, n_jobs=4):
         """
@@ -139,7 +141,6 @@ class WordVocabEncoder:
         if not vocab:
             return None
         return {idx: key for key, idx in vocab.items()}
-
 
 # if __name__ == '__main__':
 #     a = WordVocabEncoder()

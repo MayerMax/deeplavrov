@@ -103,6 +103,11 @@ class WordVocabEncoder:
 
             self.target_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.target_vocab)
 
+    def get_index_of_word(self, word, is_source=True):
+        if is_source:
+            return self.source_vocab.get(word, None)
+        return self.target_vocab.get(word, None)
+
     def save(self, filename):
         fields = {k: v for k, v in self.__dict__.items() if k not in ['source_reverse_vocab', 'target_reverse_vocab']}
         # do not save reverse vocab as it is redundant
@@ -118,6 +123,7 @@ class WordVocabEncoder:
     def _build_vocab_from_file(self, filename, tokenizing_method, n_jobs=4):
         start = time.time()
         frequencies = Counter()
+        max_len = 0
         with open(filename, encoding=self.encoding) as f:
             while True:
                 batch = list(islice(f, 100000))
@@ -126,8 +132,10 @@ class WordVocabEncoder:
                 with Pool(n_jobs) as pool:
                     for processed in pool.imap(func=tokenizing_method, iterable=batch):
                         frequencies.update([self.start_symbol] + processed + [self.end_symbol])
+                        max_len = max(max_len, len(processed)+2)
         end = time.time()
         print('Building vocab from {} took {} second(s)'.format(filename, end - start))
+        print('Max seq len {}'.format(max_len))
 
         vocab = {token: index for index, token in enumerate(frequencies.keys(), start=1)  # 0 and -1 are reserved
                  if frequencies[token] >= self.word_min_freq}

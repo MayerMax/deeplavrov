@@ -1,8 +1,6 @@
-import json
+import pickle
 import time
-from collections import Counter
-from itertools import islice, chain
-from multiprocessing.pool import Pool
+
 
 import nltk
 from keras.preprocessing.sequence import pad_sequences
@@ -12,144 +10,60 @@ _tokenizer = {
 }
 
 
-class WordVocabEncoder:
-    def __init__(self, source_vocab=None,
-                 target_vocab=None,
-                 source_tokenizing_method='nltk', target_tokenizing_method='nltk',
-                 max_source_len=120, max_target_len=120, padding_symbol='<pad>', pad_source_pre=True,
-                 pad_target_pre=False, unknown_symbol='<unk>',
-                 start_symbol='#start#', end_symbol='#end#', encoding='utf-8', word_min_freq=2, **kwargs):
+class Index:
+    def __init__(self, corpora=None, tokenizer='nltk', padding='post', to_lower=True,
+                 word2idx=None, idx2word=None, vocab=None, max_len=0):
+        self.word2idx = word2idx if word2idx else {}
+        self.idx2word = idx2word if idx2word else {}
+        self.vocab = vocab if vocab else set()
+        self.max_len = max_len
+        self.tokenizer = tokenizer
+        self.padding = padding
+        self.to_lower = to_lower
 
-        self.source_vocab = source_vocab
-        self.target_vocab = target_vocab
+        if corpora:
+            self.build(corpora)
 
-        self.source_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.source_vocab)
-        self.target_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.target_vocab)
+    def build(self, corpora):
+        start = time.time()
+        with open(corpora, 'r', encoding='utf-8') as f:
+            for phrase in f:
+                if not phrase:
+                    continue
+                if self.to_lower:
+                    phrase = phrase.lower().strip()
+                tokens = ['<start>'] + _tokenizer[self.tokenizer](phrase) + ['<end>']
+                self.max_len = max(self.max_len, len(tokens))
+                self.vocab.update(tokens)
 
-        self.source_tokenizing_method = source_tokenizing_method
-        self.target_tokenizing_method = target_tokenizing_method
+        self.vocab = sorted(self.vocab)
+        self.word2idx['<pad>'] = 0
+        self.idx2word[0] = '<pad>'
 
-        self.max_source_len = max_source_len
-        self.max_target_len = max_target_len
+        for index, word in enumerate(self.vocab, 1):
+            self.word2idx[word] = index
+            self.idx2word[index] = word
+        end = time.time()
+        print('Building vocab took {} second(s)'.format(end-start))
 
-        self.padding_symbol = padding_symbol
-        self.pad_source_pre = pad_source_pre
-        self.pad_target_pre = pad_target_pre
+    def text_to_sequence(self, text):
+        if self.to_lower:
+            text = text.lower()
+        tokens = ['<start>'] + _tokenizer[self.tokenizer](text) + ['<end>']
+        indices = [self.word2idx[t] for t in tokens]
+        return pad_sequences([indices], maxlen=self.max_len, padding=self.padding)[0]
 
-        self.unknown_symbol = unknown_symbol
-        self.start_symbol = start_symbol
-        self.end_symbol = end_symbol
-        self.encoding = encoding
-        self.word_min_freq = word_min_freq
-
-    def to_indices(self, text, is_source=True):
-        if is_source:
-            return [self.source_vocab.get(x, -1) for x in chain([self.start_symbol],
-                                                                _tokenizer.get(self.source_tokenizing_method)(text),
-                                                                [self.end_symbol])]
-        return [self.target_vocab.get(x, -1) for x in chain([self.start_symbol],
-                                                            _tokenizer.get(self.target_tokenizing_method)(text),
-                                                            [self.end_symbol])]
-
-    def to_text(self, indices, is_source=True):
-        if is_source:
-            exclude = [0, self.source_vocab[self.start_symbol], self.source_vocab[self.end_symbol]]
-            return ' '.join([self.source_reverse_vocab[x] for x in indices if x not in exclude])
-        else:
-            exclude = [0, self.target_vocab[self.start_symbol], self.target_vocab[self.end_symbol]]
-            return ' '.join([self.target_reverse_vocab[x] for x in indices if x not in exclude])
-
-    def pad_indices(self, indices, is_source=True):
-        if is_source:
-            strategy = 'pre' if self.pad_source_pre else 'post'
-            return pad_sequences([indices], maxlen=self.max_source_len, padding=strategy)[0]
-        else:
-            strategy = 'pre' if self.pad_target_pre else 'post'
-            return pad_sequences([indices], maxlen=self.max_target_len, padding=strategy)[0]
-
-    def text_to_indices(self, text, is_source=True):
-        indices = self.to_indices(text, is_source)
-        return self.pad_indices(indices, is_source)
-
-    def build(self, source_corpora, target_corpora, n_jobs=4):
-        """
-        builds vocabulary for both corporas (they must be parallel)
-        :param source_corpora: txt file path where every instance is separated with \n
-        :param target_corpora: txt file path where every instance is separated with \n
-        :param n_jobs: cores for multiprocessing
-        :return: None
-        """
-        self.build_from_corpora(source_corpora, is_source=True, n_jobs=n_jobs)
-        self.build_from_corpora(target_corpora, is_source=False, n_jobs=n_jobs)
-
-    def build_from_corpora(self, corpora, is_source=True, n_jobs=4):
-        """
-        builds vocab only for one corpora, by default assuming it is source
-        :param corpora:  txt file path where every instance is separated with \n
-        :param is_source: is corpora a source or target
-        :param n_jobs : cores for multiprocessing
-        :return: None
-        """
-        if is_source:
-            self.source_vocab = self._build_vocab_from_file(corpora,
-                                                            _tokenizer.get(self.source_tokenizing_method),
-                                                            n_jobs)
-
-            self.source_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.source_vocab)
-        else:
-            self.target_vocab = self._build_vocab_from_file(corpora,
-                                                            _tokenizer.get(self.target_tokenizing_method),
-                                                            n_jobs)
-
-            self.target_reverse_vocab = WordVocabEncoder._get_reverse_vocab(self.target_vocab)
-
-    def get_index_of_word(self, word, is_source=True):
-        if is_source:
-            return self.source_vocab.get(word, None)
-        return self.target_vocab.get(word, None)
+    def sequence_to_text(self, sequence):
+        return ' '.join(self.idx2word[x] for x in sequence).replace('<start>', '').replace('<end>', '').replace('<pad>',
+                                                                                                                '').strip()
 
     def save(self, filename):
-        fields = {k: v for k, v in self.__dict__.items() if k not in ['source_reverse_vocab', 'target_reverse_vocab']}
-        # do not save reverse vocab as it is redundant
-        with open(filename, 'w') as f:
-            json.dump(fields, f)
+        fields = {k: v for k, v in self.__dict__.items()}
+        with open(filename, 'wb') as f:
+            pickle.dump(fields, f)
 
     @classmethod
     def load(cls, filename):
-        with open(filename, 'r') as f:
-            fields = json.load(f)
-        return WordVocabEncoder(**fields)
-
-    def _build_vocab_from_file(self, filename, tokenizing_method, n_jobs=4):
-        start = time.time()
-        frequencies = Counter()
-        max_len = 0
-        with open(filename, encoding=self.encoding) as f:
-            while True:
-                batch = list(islice(f, 100000))
-                if not batch:
-                    break
-                with Pool(n_jobs) as pool:
-                    for processed in pool.imap(func=tokenizing_method, iterable=batch):
-                        frequencies.update([self.start_symbol] + processed + [self.end_symbol])
-                        max_len = max(max_len, len(processed)+2)
-        end = time.time()
-        print('Building vocab from {} took {} second(s)'.format(filename, end - start))
-        print('Max seq len {}'.format(max_len))
-
-        vocab = {token: index for index, token in enumerate(frequencies.keys(), start=1)  # 0 and -1 are reserved
-                 if frequencies[token] >= self.word_min_freq}
-        vocab[self.padding_symbol] = 0  # index for padding is 0
-        vocab[self.unknown_symbol] = -1  # index for unknown is -1
-
-        return vocab
-
-    @classmethod
-    def _get_reverse_vocab(cls, vocab):
-        if not vocab:
-            return None
-        return {idx: key for key, idx in vocab.items()}
-
-# if __name__ == '__main__':
-#     a = WordVocabEncoder()
-#     a.save('a')
+        with open(filename, 'rb') as f:
+            fields = pickle.load(f)
+        return Index(**fields)

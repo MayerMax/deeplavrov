@@ -1,11 +1,13 @@
 import json
 import os
+import pickle
 import time
 
 from itertools import islice
 from multiprocessing.pool import Pool
 
 import tqdm
+from nltk.translate.bleu_score import sentence_bleu
 
 from deeplavrov.models.attention.layers import BahdanauAttention, LuongMultiplicativeStyle
 from deeplavrov.vocabulary.vocabulary import Index
@@ -76,23 +78,32 @@ class Decoder(tf.keras.Model):
 class AttentionRNNTranslator:
     def __init__(self, input_embed_size=256, target_embed_size=256, num_units=1024, batch_size=16, num_epochs=20,
                  input_tokenizer='nltk', target_tokenizer='nltk', input_padding='pre', target_padding='post',
-                 to_lower=True):
+                 to_lower=True, input_index=None, target_index=None, checkpoint_dir=None):
         self.input_embed_size = input_embed_size
         self.target_embed_size = target_embed_size
         self.num_units = num_units
         self.batch_size = batch_size
         self.num_epochs = num_epochs
 
-        self.input_index = Index(tokenizer=input_tokenizer, padding=input_padding, to_lower=to_lower)
-        self.target_index = Index(tokenizer=target_tokenizer, padding=target_padding, to_lower=to_lower)
+        self.input_index = input_index if input_index else Index(tokenizer=input_tokenizer, padding=input_padding,
+                                                                 to_lower=to_lower)
+
+        self.target_index = target_index if target_index else Index(tokenizer=target_tokenizer, padding=target_padding,
+                                                                    to_lower=to_lower)
 
         self.encoder = None
         self.decoder = None
 
-        self.checkpoint_dir = './training_checkpoints'
+        self.checkpoint_dir = checkpoint_dir if checkpoint_dir else './training_checkpoints'
         self.checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt")
         self.checkpoint = None
-        self.optimizer = tf.train.AdamOptimizer()
+        self.optimizer = None
+
+        self._fields_to_save = {k: v for k, v in self.__dict__.items() if k not in ['encoder',
+                                                                                    'decoder',
+                                                                                    'checkpoint',
+                                                                                    'optimizer',
+                                                                                    'checkpoint_prefix']}
 
     def _step(self, inp, targ, enc_hidden):
         loss = 0
@@ -120,7 +131,7 @@ class AttentionRNNTranslator:
 
         return batch_loss
 
-    def batch_generator(self, input_file, target_file):
+    def _batch_generator(self, input_file, target_file):
         with open(input_file, 'r', encoding='utf-8') as first, open(target_file, 'r', encoding='utf-8') as second:
             inp, targ = first.readline(), second.readline()
             while inp:
@@ -132,16 +143,11 @@ class AttentionRNNTranslator:
         self.input_index.build(input_file)
         self.target_index.build(target_file)
 
-        self.input_index.save('rus-eng/eng_anki_index_test.pickle')
-        self.target_index.save('rus-eng/ru_anki_index_test.pickle')
-
-        gen = lambda: self.batch_generator(input_file, target_file)
+        gen = lambda: self._batch_generator(input_file, target_file)
         dataset = tf.data.Dataset.from_generator(gen, (tf.int32, tf.int32))
         dataset = dataset.batch(self.batch_size, drop_remainder=True)
 
-        self.encoder = Encoder(len(self.input_index.word2idx), self.input_embed_size, self.num_units, self.batch_size)
-        self.decoder = Decoder(len(self.target_index.word2idx), self.target_embed_size, self.num_units, self.batch_size)
-        self.checkpoint = tf.train.Checkpoint(optimizer=self.optimizer, encoder=self.encoder, decoder=self.decoder)
+        self._init_model()
 
         for epoch in range(self.num_epochs):
             start = time.time()
@@ -161,7 +167,7 @@ class AttentionRNNTranslator:
             print('Epoch {} Loss {:.4f}'.format(epoch + 1, total_loss / batch))
             print('Time taken for 1 epoch {} sec\n'.format(time.time() - start))
 
-    def translate(self, sentence):
+    def translate(self, sentence, return_as_tokens=True):
         inputs = [self.input_index.text_to_sequence(sentence)]
         inputs = tf.convert_to_tensor(inputs)
 
@@ -184,7 +190,36 @@ class AttentionRNNTranslator:
 
             dec_input = tf.expand_dims([predicted_id], 0)
 
-        return self.target_index.sequence_to_text(result)
+        return self.target_index.sequence_to_text(result, return_as_tokens)
 
+    def get_bleu_score(self, input_file, target_file):
+        score = 0
+        counter = 0
+        with open(input_file, 'r', encoding='utf-8') as first, open(target_file, 'r', encoding='utf-8') as second:
+            inp, targ = first.readline(), second.readline()
+            while inp:
+                translation = self.translate(inp.strip())
+                reference = [self.target_index.tokenize(targ.strip())]
+                score += sentence_bleu(reference, translation)
+                counter += 1
+                inp, targ = first.readline(), second.readline()
+        return (score / counter) * 100
 
+    def save(self, filename):
+        with open(filename, 'wb') as f:
+            pickle.dump(self._fields_to_save, f)
 
+    @classmethod
+    def load(cls, filename):
+        with open(filename, 'rb') as f:
+            fields = pickle.load(f)
+        obj = AttentionRNNTranslator(**fields)
+        obj._init_model()
+        obj.checkpoint.restore(tf.train.latest_checkpoint(obj.checkpoint_dir))
+        return obj
+
+    def _init_model(self):
+        self.encoder = Encoder(len(self.input_index.word2idx), self.input_embed_size, self.num_units, self.batch_size)
+        self.decoder = Decoder(len(self.target_index.word2idx), self.target_embed_size, self.num_units, self.batch_size)
+        self.optimizer = tf.train.AdamOptimizer()
+        self.checkpoint = tf.train.Checkpoint(optimizer=self.optimizer, encoder=self.encoder, decoder=self.decoder)

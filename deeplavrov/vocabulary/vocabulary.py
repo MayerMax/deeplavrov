@@ -1,7 +1,6 @@
 import pickle
 import time
 
-
 import nltk
 from keras.preprocessing.sequence import pad_sequences
 
@@ -44,7 +43,7 @@ class Index:
             self.word2idx[word] = index
             self.idx2word[index] = word
         end = time.time()
-        print('Building vocab took {} second(s)'.format(end-start))
+        print('Building vocab took {} second(s)'.format(end - start))
 
     def text_to_sequence(self, text):
         if self.to_lower:
@@ -53,9 +52,14 @@ class Index:
         indices = [self.word2idx[t] for t in tokens]
         return pad_sequences([indices], maxlen=self.max_len, padding=self.padding)[0]
 
-    def sequence_to_text(self, sequence):
-        return ' '.join(self.idx2word[x] for x in sequence).replace('<start>', '').replace('<end>', '').replace('<pad>',
-                                                                                                                '').strip()
+    def sequence_to_text(self, sequence, return_as_tokens=True):
+        tokens = [self.idx2word[x] for x in sequence if self.idx2word[x] not in ['<start>', '<end>', '<pad>', ' ']]
+        if return_as_tokens:
+            return tokens
+        return ' '.join(tokens).strip()
+
+    def tokenize(self, text):
+        return _tokenizer[self.tokenizer](text)
 
     def save(self, filename):
         fields = {k: v for k, v in self.__dict__.items()}

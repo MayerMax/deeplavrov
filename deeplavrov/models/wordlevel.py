@@ -1,19 +1,13 @@
-import json
 import os
 import pickle
 import time
 
-from itertools import islice
-from multiprocessing.pool import Pool
-
-import tqdm
+import numpy as np
+import tensorflow as tf
 from nltk.translate.bleu_score import sentence_bleu
 
-from deeplavrov.models.attention.layers import BahdanauAttention, LuongMultiplicativeStyle
+from deeplavrov.models.attention.layers import BahdanauAttention
 from deeplavrov.vocabulary.vocabulary import Index
-
-import tensorflow as tf
-import numpy as np
 
 
 def loss_function(real, pred):

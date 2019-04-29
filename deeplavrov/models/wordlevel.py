@@ -206,6 +206,8 @@ class AttentionRNNTranslator:
         return (score / counter) * 100
 
     def save(self, filename):
+        print('Saved!')
+        self.checkpoint.save(file_prefix=self.checkpoint_prefix)
         with open(filename, 'wb') as f:
             pickle.dump(self._fields_to_save, f)
 

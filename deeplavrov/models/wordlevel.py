@@ -1,26 +1,13 @@
-import json
 import os
+import pickle
 import time
 
-from itertools import islice
-from multiprocessing.pool import Pool
-
-import tqdm
-
-from deeplavrov.vocabulary.vocabulary import WordVocabEncoder
-
-import tensorflow as tf
-
 import numpy as np
-from keras.layers import Embedding, GRU, Dense, CuDNNGRU
+import tensorflow as tf
+from nltk.translate.bleu_score import sentence_bleu
 
-
-def create_gru(units):
-    # if tf.test.is_gpu_available():
-    #     return CuDNNGRU(units, return_sequences=True, return_state=True, recurrent_initializer='glorot_uniform')
-    # else:
-    return GRU(units, return_sequences=True, return_state=True, recurrent_activation='sigmoid',
-               recurrent_initializer='glorot_uniform')
+from deeplavrov.models.attention.layers import BahdanauAttention
+from deeplavrov.vocabulary.vocabulary import Index
 
 
 def loss_function(real, pred):
@@ -34,8 +21,13 @@ class Encoder(tf.keras.Model):
         super(Encoder, self).__init__()
         self.batch_sz = batch_sz
         self.enc_units = enc_units
-        self.embedding = Embedding(vocab_size, embedding_dim)
-        self.gru = create_gru(self.enc_units)
+        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        if tf.test.is_gpu_available():
+            self.gru = tf.keras.layers.CuDNNGRU(self.enc_units, return_sequences=True, return_state=True,
+                                                recurrent_initializer='glorot_uniform')
+        else:
+            self.gru = tf.keras.layers.GRU(self.enc_units, return_sequences=True, return_state=True,
+                                           recurrent_initializer='glorot_uniform')
 
     def call(self, x, hidden):
         x = self.embedding(x)
@@ -51,181 +43,179 @@ class Decoder(tf.keras.Model):
         super(Decoder, self).__init__()
         self.batch_sz = batch_sz
         self.dec_units = dec_units
-        self.embedding = Embedding(vocab_size, embedding_dim)
-        self.gru = create_gru(self.dec_units)
-        self.fc = Dense(vocab_size)
+        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        if tf.test.is_gpu_available():
+            self.gru = tf.keras.layers.CuDNNGRU(self.dec_units, return_sequences=True, return_state=True,
+                                                recurrent_initializer='glorot_uniform')
+        else:
+            self.gru = tf.keras.layers.GRU(self.dec_units, return_sequences=True, return_state=True,
+                                           recurrent_initializer='glorot_uniform')
 
-        self.W1 = Dense(self.dec_units)
-        self.W2 = Dense(self.dec_units)
-        self.V = Dense(1)
+        self.fc = tf.keras.layers.Dense(vocab_size)
+
+        self.attention = BahdanauAttention(self.dec_units)
 
     def call(self, x, hidden, enc_output):
-        hidden_with_time_axis = tf.expand_dims(hidden, 1)
-
-        score = self.V(tf.nn.tanh(self.W1(enc_output) + self.W2(hidden_with_time_axis)))
-
-        attention_weights = tf.nn.softmax(score, axis=1)
-
-        context_vector = attention_weights * enc_output
-        context_vector = tf.reduce_sum(context_vector, axis=1)
+        context_vector, attention_weights = self.attention(hidden, enc_output)
 
         x = self.embedding(x)
         x = tf.concat([tf.expand_dims(context_vector, 1), x], axis=-1)
 
         output, state = self.gru(x)
-
         output = tf.reshape(output, (-1, output.shape[2]))
 
-        x = self.fc(output)
+        logits = self.fc(output)
 
-        return x, state, attention_weights
-
-    def initialize_hidden_state(self):
-        return tf.zeros((self.batch_sz, self.dec_units))
+        return logits, state, attention_weights
 
 
-class WordLevelRNNTranslator:
-    def __init__(self, source_embed_size=256, target_embed_size=256, num_units=1024, batch_size=64, num_epochs=20,
-                 **kwargs):
-        """
-        Write the docs!
-        """
-        self.source_embed_size = source_embed_size
+class AttentionRNNTranslator:
+    def __init__(self, input_embed_size=256, target_embed_size=256, num_units=1024, batch_size=16, num_epochs=20,
+                 input_tokenizer='nltk', target_tokenizer='nltk', input_padding='pre', target_padding='post',
+                 to_lower=True, input_index=None, target_index=None, checkpoint_dir=None):
+        self.input_embed_size = input_embed_size
         self.target_embed_size = target_embed_size
         self.num_units = num_units
         self.batch_size = batch_size
         self.num_epochs = num_epochs
 
-        self.vocab_encoder = WordVocabEncoder(**kwargs)
-        self.params_to_save = kwargs
+        self.input_index = input_index if input_index else Index(tokenizer=input_tokenizer, padding=input_padding,
+                                                                 to_lower=to_lower)
+
+        self.target_index = target_index if target_index else Index(tokenizer=target_tokenizer, padding=target_padding,
+                                                                    to_lower=to_lower)
 
         self.encoder = None
         self.decoder = None
 
-        self.checkpoint_dir = None
-        self.checkpoint_prefix = None
+        self.checkpoint_dir = checkpoint_dir if checkpoint_dir else './training_checkpoints'
+        self.checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt")
         self.checkpoint = None
+        self.optimizer = None
 
-    def load(self, filename):
-        pass
+        self._fields_to_save = {k: v for k, v in self.__dict__.items() if k not in ['encoder',
+                                                                                    'decoder',
+                                                                                    'checkpoint',
+                                                                                    'optimizer',
+                                                                                    'checkpoint_prefix']}
 
-    def save(self, filename):
-        pass
+    def _step(self, inp, targ, enc_hidden):
+        loss = 0
+        with tf.GradientTape() as tape:
+            enc_output, enc_hidden = self.encoder(inp, enc_hidden)
 
-    def _process_pair(self, source_target_pair):
-        source_text, target_text = source_target_pair
-        return (self.vocab_encoder.text_to_indices(source_text.strip(), is_source=True),
-                self.vocab_encoder.text_to_indices(target_text.strip(), is_source=False))
+            dec_hidden = enc_hidden
 
-    def _file_generator(self, source_filename, target_filename, n_jobs=4):
-        with open(source_filename, encoding='utf-8') as source_f, open(target_filename, encoding='utf-8') as target_f:
-            with Pool(n_jobs) as pool:
-                while True:
-                    source_batch = list(islice(source_f, 100000))
-                    target_batch = list(islice(target_f, 100000))
-                    if not source_batch or not target_batch:
-                        break
+            dec_input = tf.expand_dims([self.target_index.word2idx['<start>']] * self.batch_size, 1)
 
-                    yield from pool.imap(func=self._process_pair, iterable=zip(source_batch, target_batch))
+            # teacher forcing
+            for t in range(1, targ.shape[1]):
+                predictions, dec_hidden, _ = self.decoder(dec_input, dec_hidden, enc_output)
 
-    def generator(self, source_filename, target_filename):
-        with open(source_filename, encoding='utf-8') as source_f, open(target_filename, encoding='utf-8') as target_f:
-            eng_line, ru_line = source_f.readline().strip(), target_f.readline().strip()
-            while eng_line:
-                yield self.vocab_encoder.text_to_indices(eng_line, True), \
-                      self.vocab_encoder.text_to_indices(ru_line, False)
+                loss += loss_function(targ[:, t], predictions)
+                dec_input = tf.expand_dims(targ[:, t], 1)
 
-    def fit_from_file(self, source_corpora, target_corpora, n_jobs=4, checkpoint_dir='./training_checkpoints'):
-        # self.vocab_encoder.build(source_corpora, target_corpora, n_jobs=n_jobs)
-        # self.vocab_encoder.save('vocabulary_index.json')
-        self.vocab_encoder = WordVocabEncoder.load('../vocabulary_index.json')
-        self.params_to_save['index_path'] = 'vocabulary_index.json'  # fix later
+            batch_loss = (loss / int(targ.shape[1]))
 
-        self.encoder = Encoder(len(self.vocab_encoder.source_vocab),
-                               self.source_embed_size, self.num_units, self.batch_size)
-        self.decoder = Decoder(len(self.vocab_encoder.target_vocab),
-                               self.target_embed_size, self.num_units, self.batch_size)
-        optimizer = tf.train.AdamOptimizer()
+            variables = self.encoder.trainable_variables + self.decoder.trainable_variables
 
-        self.checkpoint_dir = checkpoint_dir
-        self.checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-        self.checkpoint = tf.train.Checkpoint(optimizer=optimizer,
-                                              encoder=self.encoder,
-                                              decoder=self.decoder)
+            gradients = tape.gradient(loss, variables)
 
-        gen = lambda: self.generator(source_corpora, target_corpora)
+            self.optimizer.apply_gradients(zip(gradients, variables))
 
+        return batch_loss
+
+    def _batch_generator(self, input_file, target_file):
+        with open(input_file, 'r', encoding='utf-8') as first, open(target_file, 'r', encoding='utf-8') as second:
+            inp, targ = first.readline(), second.readline()
+            while inp:
+                yield (self.input_index.text_to_sequence(inp),
+                       self.target_index.text_to_sequence(targ))
+                inp, targ = first.readline(), second.readline()
+
+    def fit_from_file(self, input_file, target_file, val_input_file=None, val_target_file=None):
+        self.input_index.build(input_file)
+        self.target_index.build(target_file)
+
+        gen = lambda: self._batch_generator(input_file, target_file)
         dataset = tf.data.Dataset.from_generator(gen, (tf.int32, tf.int32))
         dataset = dataset.batch(self.batch_size, drop_remainder=True)
 
-        try:
-            for epoch in tqdm.tqdm(range(self.num_epochs)):
-                start = time.time()
+        self._init_model()
 
-                hidden = self.encoder.initialize_hidden_state()
-                total_loss = 0
+        for epoch in range(self.num_epochs):
+            start = time.time()
+            enc_hidden = self.encoder.initialize_hidden_state()
+            total_loss = 0
 
-                for (batch_index, (source, target)) in enumerate(dataset):
-                    cur_loss = 0
-                    with tf.GradientTape() as tape:
-                        encoder_output, encoder_hidden = self.encoder(source, hidden)
+            for (batch, (inp, targ)) in enumerate(dataset):
+                batch_loss = self._step(inp, targ, enc_hidden)
+                total_loss += batch_loss
 
-                        decoder_hidden = encoder_hidden
-                        decoder_input = tf.expand_dims([self.vocab_encoder.get_index_of_word(
-                            self.vocab_encoder.start_symbol)] * self.batch_size, 1)
+                if batch % 100 == 0:
+                    print('Epoch {} Batch {} Loss {:.4f}'.format(epoch + 1, batch, batch_loss.numpy()))
 
-                        # right now using teacher forcing: feeding the target as the next input
-                        # add code to change this option ...
+            if (epoch + 1) % 2 == 0:
+                self.checkpoint.save(file_prefix=self.checkpoint_prefix)
 
-                        for timestamp in range(1, target.shape[1]):
-                            predictions, dec_hidden, _ = self.decoder(decoder_input, decoder_hidden, encoder_output)
-                            cur_loss += loss_function(target[:, timestamp], predictions)
+            print('Epoch {} Loss {:.4f}'.format(epoch + 1, total_loss / batch))
+            print('Time taken for 1 epoch {} sec\n'.format(time.time() - start))
 
-                            decoder_input = tf.expand_dims(target[:, timestamp], 1)
-                    batch_loss = (cur_loss / int(target.shape[1]))
-                    total_loss += batch_loss
+    def translate(self, sentence, return_as_tokens=True):
+        inputs = [self.input_index.text_to_sequence(sentence)]
+        inputs = tf.convert_to_tensor(inputs)
 
-                    variables = self.encoder.variables + self.decoder.variables
-                    gradients = tape.gradient(cur_loss, variables)
+        result = []
 
-                    optimizer.apply_gradients(zip(gradients, variables))
+        hidden = [tf.zeros((1, self.num_units))]
+        enc_out, enc_hidden = self.encoder(inputs, hidden)
 
-                    if batch_index % 100 == 0:
-                        print('Epoch {} Batch {} Loss {:.4f}'.format(epoch + 1, batch_index, batch_loss.numpy()))
+        dec_hidden = enc_hidden
+        dec_input = tf.expand_dims([self.target_index.word2idx['<start>']], 0)
 
-                if (epoch + 1) % 2 == 0:
-                    self.checkpoint.save(file_prefix=self.checkpoint_prefix)
+        for t in range(self.target_index.max_len):
+            predictions, dec_hidden, attention_weights = self.decoder(dec_input, dec_hidden, enc_out)
 
-                print('Epoch {} Loss {:.4f}'.format(epoch + 1,
-                                                    total_loss / batch_index))
-                print('Time taken for 1 epoch {} sec\n'.format(time.time() - start))
-        except KeyboardInterrupt as _:
-            print('Saving before interruption')
-            self._save()
-            print('Saved')
-        print('Saving after all epochs')
-        self._save()
-        print('Saved')
+            predicted_id = tf.argmax(predictions[0]).numpy()
+            result.append(predicted_id)
 
-    def _save(self):
+            if self.target_index.idx2word[predicted_id] == '<end>':
+                return self.target_index.sequence_to_text(result)
+
+            dec_input = tf.expand_dims([predicted_id], 0)
+
+        return self.target_index.sequence_to_text(result, return_as_tokens)
+
+    def get_bleu_score(self, input_file, target_file):
+        score = 0
+        counter = 0
+        with open(input_file, 'r', encoding='utf-8') as first, open(target_file, 'r', encoding='utf-8') as second:
+            inp, targ = first.readline(), second.readline()
+            while inp:
+                translation = self.translate(inp.strip())
+                reference = [self.target_index.tokenize(targ.strip())]
+                score += sentence_bleu(reference, translation)
+                counter += 1
+                inp, targ = first.readline(), second.readline()
+        return (score / counter) * 100
+
+    def save(self, filename):
+        print('Saved!')
         self.checkpoint.save(file_prefix=self.checkpoint_prefix)
-        path_to_model = tf.train.latest_checkpoint(self.checkpoint_dir)
+        with open(filename, 'wb') as f:
+            pickle.dump(self._fields_to_save, f)
 
-        fields = {k: v for k, v in self.__dict__.items() if k not in ['source_reverse_vocab',
-                                                                      'target_reverse_vocab',
-                                                                      'encoder', 'decoder',
-                                                                      'checkpoint']}
-        fields['path_to_model'] = path_to_model
-        fields['path_to_index'] = 'vocabulary_index.json'
-        with open('model.json', 'w') as f:
-            json.dump(fields, f)
+    @classmethod
+    def load(cls, filename):
+        with open(filename, 'rb') as f:
+            fields = pickle.load(f)
+        obj = AttentionRNNTranslator(**fields)
+        obj._init_model()
+        obj.checkpoint.restore(tf.train.latest_checkpoint(obj.checkpoint_dir))
+        return obj
 
-
-if __name__ == '__main__':
-    tf.enable_eager_execution()
-    params = {
-        'max_source_len': 49,
-        'max_target_len': 51
-    }
-    translator = WordLevelRNNTranslator(**params)
-    translator.fit_from_file('../data/eng_anki_corpora.txt', '../data/ru_anki_corpora.txt')
+    def _init_model(self):
+        self.encoder = Encoder(len(self.input_index.word2idx), self.input_embed_size, self.num_units, self.batch_size)
+        self.decoder = Decoder(len(self.target_index.word2idx), self.target_embed_size, self.num_units, self.batch_size)
+        self.optimizer = tf.train.AdamOptimizer()
+        self.checkpoint = tf.train.Checkpoint(optimizer=self.optimizer, encoder=self.encoder, decoder=self.decoder)
